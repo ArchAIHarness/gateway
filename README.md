@@ -1,11 +1,142 @@
-# ArchAIHarness Gateway · 架构手册
+<div align="center">
 
-> 本文档面向架构师与核心开发者,详细描述网关的设计意图、流程、SPI 契约与配置参考。
-> 面向使用者的入门请看 [README.md](./README.md);面向 AI 协作者的约束请看 [AGENTS.md](./AGENTS.md)。
+# ArchAIHarness Gateway
+
+**反应式 API 网关 · 可插拔鉴权 · 多租户访问控制 · K8s 原生**
+
+[![Java](https://img.shields.io/badge/Java-17-007396?logo=openjdk&logoColor=white)](https://openjdk.org/)
+[![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.2.5-6DB33F?logo=springboot&logoColor=white)](https://spring.io/projects/spring-boot)
+[![Spring Cloud Gateway](https://img.shields.io/badge/Spring%20Cloud%20Gateway-2023.0.3-6DB33F?logo=spring&logoColor=white)](https://spring.io/projects/spring-cloud-gateway)
+[![Reactor](https://img.shields.io/badge/Reactive-Project%20Reactor-006B6F?logo=reactivex&logoColor=white)](https://projectreactor.io/)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-Service%20Discovery-326CE5?logo=kubernetes&logoColor=white)](https://kubernetes.io/)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
+</div>
 
 ---
 
-## 1. 设计目标
+`gateway` 是 **ArchAIHarness** 体系下的反应式 API 网关:
+
+- 🚀 **零硬编码** —— Token 校验 / 缓存 / 租户校验 / Header 透传 / Token 续期全部基于 SPI,默认实现开箱即用,业务定制只需一个 `@Bean`
+- 🧩 **配置即行为** —— Header 名、Auth URL、TTL、阈值统一收敛到 `archai.gateway.*`,无 magic string
+- 🏛 **K8s 原生** —— Spring Cloud Kubernetes 服务发现 + DiscoveryLocator 自动路由,无需路由表维护
+- 🔒 **多租户内建** —— `x-tenant-id` / `x-tenant-ids` 模型默认支持,通配符 `*` 表达跨租户访问
+- ⚡ **全反应式** —— WebFlux + WebClient,禁绝任何阻塞 API
+
+| 项目 | 内容 |
+|------|------|
+| **文档版本** | 1.0.0 |
+| **维护者** | ArchAIHarness Architects |
+| **更新记录** | 2026-06-02 1.0.0 · 从 api-gateway 提炼,引入 6 个 SPI 与零硬编码配置 |
+
+> 文档结构:**先开箱即用**(§一),再深入设计意图与 SPI 契约(§二 及以后)。AI 协作约束见 [AGENTS.md](./AGENTS.md)。
+
+## 一、5 分钟开箱即用
+
+### 1.1 三件套依赖
+
+```bash
+# 1) 检查环境
+java --version        # 期望 17
+mvn --version         # 期望 3.8+
+docker --version      # 期望 20+
+```
+
+### 1.2 跑起来
+
+```bash
+# 1) 克隆
+git clone https://github.com/ArchAIHarness/gateway.git
+cd gateway
+
+# 2) 编译打包
+mvn clean package -DskipTests
+
+# 3) 启动(裸机本地试跑;K8s 部署见 §1.5)
+java -jar target/gateway-1.0.0-SNAPSHOT.jar
+
+# 4) 健康验证
+curl http://localhost:8080/actuator/health/readiness
+# 期望: {"status":"UP"}
+```
+
+### 1.3 默认行为速查
+
+启动后,网关已经具备完整能力,**零配置可用**。下表说明默认实现对各种请求的反应:
+
+| 请求情形 | 默认行为 | 涉及 SPI |
+|---|---|---|
+| `OPTIONS /xxx`(CORS 预检) | 直接 200 放行 | — |
+| 无 `Authorization` 头的请求 | 直接路由到下游,由下游决定是否要求登录 | `TokenExtractor` |
+| 带 `Bearer xxx` 的请求 | 查缓存 → 命中走缓存;未命中调 `http://auth` 校验 | `TokenIntrospector` + `AuthenticationCache` |
+| Token 无效 / 缺 userId | 返回 `401 Invalid token` | — |
+| Auth 服务不可达 | 返回 `503 Auth service unavailable` | — |
+| 请求 Header 带 `x-tenant-id: t1`,用户可访问 `t1,t2` | 透传 → 放行 | `TenantAccessValidator` + `HeaderEnricher` |
+| 请求 Header 带 `x-tenant-id: t9`,用户只有 `t1,t2` | 返回 `403 Forbidden: tenant not accessible` | `TenantAccessValidator` |
+| 请求 Header 带 `x-tenant-id: *` | 跨租户访问,放行 | `TenantAccessValidator` |
+| Token 剩余有效期 < 10 分钟 | 转发后自动 POST `auth/refresh_token`,新 token 通过响应头 `x-token-renewed` 返回 | `TokenRenewer` |
+
+### 1.4 路由约定
+
+依赖 Spring Cloud Gateway `DiscoveryLocator`,**不需要手写路由表**:
+
+```
+客户端请求       → /api/v2/{service}/path/to/resource
+StripPrefix(3)  → /path/to/resource
+K8s 服务发现     → http://{service}:80/path/to/resource
+```
+
+切换服务发现后端(Nacos / Eureka)只需替换 `spring-cloud-starter-kubernetes-fabric8-all` 为对应 starter,**业务代码零改动**。
+
+### 1.5 部署到 K8s
+
+```bash
+# 构建镜像
+docker build -t localhost:5001/gateway:latest .
+
+# 推送到 registry
+docker push localhost:5001/gateway:latest
+
+# 滚动更新
+kubectl set image deployment/gateway gateway=localhost:5001/gateway:latest -n <namespace>
+```
+
+资源建议:**单实例 1 核 1G**,生产环境至少 2 副本。探针端点已固定为 `/actuator/health/{liveness,readiness}`,在 K8s 清单中直接引用即可。
+
+### 1.6 常用运维端点
+
+| 端点 | 用途 |
+|------|------|
+| `/actuator/health/liveness` | K8s Liveness 探针 |
+| `/actuator/health/readiness` | K8s Readiness 探针 |
+| `/actuator/info` | 构建信息 |
+| `/actuator/metrics` | Micrometer 指标 |
+
+### 1.7 故障排查速查
+
+> ⚠️ **禁止使用 `kubectl port-forward`**,所有访问必须经由 Ingress → Service → Pod,以确保链路与生产一致。
+
+```bash
+# 看 Pod 状态与日志
+kubectl get pods -n <ns> -l app=gateway
+kubectl logs -n <ns> -l app=gateway --tail=100 -f
+
+# 路由探活
+curl -k https://<gateway-host>/api/v2/auth/health
+```
+
+常见症状对照:
+
+| 症状 | 可能原因 | 排查方向 |
+|------|---------|---------|
+| 401 Invalid token | Token 过期 / Auth 不识别 | 检查 auth 服务日志,看入参 token 是否在白名单 |
+| 401 但 Token 看着没问题 | Auth 响应缺 `x-user-id` 头 | 确认 auth 服务的合约:成功响应必须含 `x-user-id` |
+| 503 Auth service unavailable | Auth Pod 未就绪 / K8s DNS 异常 | `kubectl get endpoints auth -n <ns>` |
+| 403 Forbidden: tenant... | 请求 `x-tenant-id` 不在用户授权列表 | 看日志 `Tenant access denied` 行 |
+| 路由 404 | 目标服务未注册到 K8s | `kubectl get svc -n <ns>`,确认服务存在 |
+| Token 不续期 | 剩余有效期 > 阈值 | 验证 `archai.gateway.renew.threshold-seconds` 配置 |
+
+## 二、设计目标
 
 | 维度 | 目标 |
 |------|------|
@@ -17,7 +148,9 @@
 
 ---
 
-## 2. 整体流程
+## 三、整体流程
+
+下图展示一次请求在过滤器内的完整生命周期。所有方框标注了责任 SPI,每一格都可通过 `@Bean` 替换。
 
 ```mermaid
 flowchart TD
@@ -25,7 +158,7 @@ flowchart TD
     B -->|是| Z[200 OK 直接放行]
     B -->|否| C[TokenExtractor 提取 token]
     C --> D{有 token?}
-    D -->|否| FW[继续路由<br>下游决定是否需要认证]
+    D -->|否| FW[继续路由 · 下游决定是否需要认证]
 
     D -->|是| E[AuthenticationCache.get]
     E --> F{缓存命中且未过期?}
@@ -42,22 +175,16 @@ flowchart TD
     W -->|是| X[HeaderEnricher.enrich]
     X --> Y[chain.filter 转发]
     Y --> R{需要续期?}
-    R -->|是| RW[TokenRenewer.renew<br>侧效应,失败不影响主流程]
+    R -->|是| RW[TokenRenewer.renew · 侧效应,失败不影响主流程]
     R -->|否| END[完成]
     RW --> END
-
-    style U401 fill:#ffd6d6
-    style U403 fill:#ffd6d6
-    style Z fill:#d6f5d6
-    style FW fill:#d6f5d6
-    style END fill:#d6f5d6
 ```
 
 ---
 
-## 3. SPI 契约
+## 四、SPI 契约
 
-### 3.1 TokenExtractor
+### 4.1 TokenExtractor
 
 ```java
 String extract(ServerHttpRequest request);
@@ -69,7 +196,7 @@ String extract(ServerHttpRequest request);
 | 默认行为 | 优先 Authorization 头;回退 `token` 查询参数;自动补全 Bearer 前缀 |
 | 自定义场景 | 从 Cookie / 自定义 Header / WebSocket 子协议提取 |
 
-### 3.2 TokenIntrospector
+### 4.2 TokenIntrospector
 
 ```java
 Mono<AuthenticationResult> introspect(String bearerToken);
@@ -82,7 +209,7 @@ Mono<AuthenticationResult> introspect(String bearerToken);
 | 默认实现 | `RemoteAuthTokenIntrospector` — GET 到 `archai.gateway.auth.url`,读响应 Header |
 | 替代实现 | 本地 JWT 验签、OAuth2 Introspection、混合策略 |
 
-### 3.3 AuthenticationCache
+### 4.3 AuthenticationCache
 
 ```java
 AuthenticationResult get(String token);
@@ -97,7 +224,7 @@ void clear();
 | 默认实现 | `InMemoryAuthenticationCache`(ConcurrentHashMap + 定时清理) |
 | 替代实现 | Redis、Hazelcast、Caffeine + Sync 等 |
 
-### 3.4 TenantAccessValidator
+### 4.4 TenantAccessValidator
 
 ```java
 Mono<Void> validate(ServerWebExchange exchange,
@@ -108,10 +235,10 @@ Mono<Void> validate(ServerWebExchange exchange,
 | 项 | 约定 |
 |----|------|
 | 返回值 | `null` 表示通过;非 null 的 `Mono<Void>` 表示拒绝(必须已写入响应) |
-| 默认规则 | 见 [4. 多租户校验规则](#4-多租户校验规则) |
+| 默认规则 | 见 [§五. 多租户校验规则](#五多租户校验规则) |
 | 替代实现 | 接入 OPA / SpringSecurity ACL / 自研 RBAC |
 
-### 3.5 HeaderEnricher
+### 4.5 HeaderEnricher
 
 ```java
 void enrich(ServerHttpRequest.Builder builder,
@@ -124,7 +251,7 @@ void enrich(ServerHttpRequest.Builder builder,
 | 默认行为 | 写入 `x-user-id`、`x-tenant-id`、`x-tenant-ids`(名称可配) |
 | 自定义场景 | 增加签名时间戳、调用链 ID、网关签发的内部 JWT |
 
-### 3.6 TokenRenewer
+### 4.6 TokenRenewer
 
 ```java
 Mono<Void> renew(String cleanToken, ServerHttpResponse response);
@@ -138,7 +265,7 @@ Mono<Void> renew(String cleanToken, ServerHttpResponse response);
 
 ---
 
-## 4. 多租户校验规则
+## 五、多租户校验规则
 
 默认 `MultiTenantAccessValidator` 的判定矩阵:
 
@@ -154,7 +281,7 @@ Mono<Void> renew(String cleanToken, ServerHttpResponse response);
 
 ---
 
-## 5. JWT 安全设计
+## 六、JWT 安全设计
 
 **默认实现不在本地验签**,理由如下:
 
@@ -170,7 +297,7 @@ Mono<Void> renew(String cleanToken, ServerHttpResponse response);
 
 ---
 
-## 6. 配置参考(`archai.gateway.*`)
+## 七、配置参考(`archai.gateway.*`)
 
 | 键 | 默认值 | 说明 |
 |----|--------|------|
@@ -191,32 +318,7 @@ Mono<Void> renew(String cleanToken, ServerHttpResponse response);
 
 ---
 
-## 7. 路由
-
-依靠 Spring Cloud Gateway `DiscoveryLocator`,**无需路由表**:
-
-```
-外部请求  →  /api/v2/{service}/...
-内部转发  →  http://{service}/...     (StripPrefix(3))
-服务解析  →  K8s Service Discovery (Fabric8)
-```
-
-切换到 Nacos/Eureka 只需替换 `spring-cloud-starter-kubernetes-fabric8-all` 依赖与对应 starter,无需改业务代码。
-
----
-
-## 8. 健康检查与运维端点
-
-| 端点 | 用途 |
-|------|------|
-| `/actuator/health/liveness` | K8s Liveness 探针 |
-| `/actuator/health/readiness` | K8s Readiness 探针 |
-| `/actuator/info` | 构建信息 |
-| `/actuator/metrics` | Micrometer 指标 |
-
----
-
-## 9. 已知约束
+## 八、已知约束
 
 - 缓存为进程内,水平扩容时各实例缓存独立(可接受,因为 token 校验幂等)
 - Token 续期是 best-effort,客户端必须能容忍偶发未续期
@@ -224,7 +326,7 @@ Mono<Void> renew(String cleanToken, ServerHttpResponse response);
 
 ---
 
-## 10. 演进方向
+## 九、演进方向
 
 - [ ] 提供 Redis 共享缓存的 starter 模块
 - [ ] 提供本地 JWT 验签的 starter 模块
