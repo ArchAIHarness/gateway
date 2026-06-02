@@ -1,0 +1,56 @@
+# Compiled class files
+*.class
+
+# Package Files
+*.jar
+*.war
+*.ear
+
+# Log files
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.bak
+*~
+*.swp
+*.swo
+.DS_Store # macOS specific
+
+# Maven
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/wrapper/maven-wrapper.jar # Often ignored if not customized
+
+# Gradle
+.gradle/
+build/
+*.iml # IntelliJ IDEA project files
+.idea/ # IntelliJ IDEA project directory
+.classpath # Eclipse project files
+.project # Eclipse project files
+.settings/ # Eclipse project settings
+bin/ # Eclipse build output directory
+
+# VS Code
+.vscode/
+
+# Other IDE files
+*.pydevproject
+*.launch
+*.factorypath
+
+# Local configuration files
+local.properties
+
+application.yaml
+application.yml
+
+k8s/
